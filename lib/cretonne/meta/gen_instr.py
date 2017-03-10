@@ -7,7 +7,6 @@ import constant_hash
 from unique_table import UniqueTable, UniqueSeqTable
 from cdsl import camel_case
 from cdsl.operands import ImmediateKind
-import cdsl.types
 from cdsl.formats import InstructionFormat
 
 from cdsl.instructions import Instruction  # noqa
@@ -117,9 +116,9 @@ def gen_instruction_data_impl(fmt):
     - `pub fn opcode(&self) -> Opcode`
     - `pub fn first_type(&self) -> Type`
     - `pub fn second_result(&self) -> Option<Value>`
-    - `pub fn second_result_mut<'a>(&'a mut self)
-         -> Option<&'a mut PackedOption<Value>>`
-    - `pub fn arguments(&self) -> (&[Value], &[Value])`
+    - `pub fn second_result_mut(&mut self) -> Option<&mut PackedOption<Value>>`
+    - `pub fn arguments(&self, &pool) -> &[Value]`
+    - `pub fn arguments_mut(&mut self, &pool) -> &mut [Value]`
     """
 
     # The `opcode` and `first_type` methods simply read the `opcode` and `ty`
@@ -172,8 +171,8 @@ def gen_instruction_data_impl(fmt):
 
         fmt.doc_comment('Mutable reference to second result value, if any.')
         with fmt.indented(
-                "pub fn second_result_mut<'a>(&'a mut self)" +
-                " -> Option<&'a mut PackedOption<Value>> {", '}'):
+                "pub fn second_result_mut(&mut self)" +
+                " -> Option<&mut PackedOption<Value>> {", '}'):
             with fmt.indented('match *self {', '}'):
                 for f in InstructionFormat.all_formats:
                     if f.multiple_results:
@@ -198,7 +197,7 @@ def gen_instruction_data_impl(fmt):
                         fmt.line(n + ' { .. } => None,')
                     elif f.has_value_list:
                         # We keep all arguments in a value list.
-                        i = f.value_operands.index(f.typevar_operand)
+                        i = f.typevar_operand
                         fmt.line(
                                 '{} {{ ref args, .. }} => '
                                 'args.get({}, pool),'.format(n, i))
@@ -212,9 +211,7 @@ def gen_instruction_data_impl(fmt):
                     else:
                         # We have multiple value operands and an array `args`.
                         # Which `args` index to use?
-                        # Map from index into f.kinds into f.value_operands
-                        # index.
-                        i = f.value_operands.index(f.typevar_operand)
+                        i = f.typevar_operand
                         if f.boxed_storage:
                             fmt.line(
                                     n +
@@ -281,9 +278,10 @@ def gen_opcodes(groups, fmt):
                 # Document polymorphism.
                 if i.is_polymorphic:
                     if i.use_typevar_operand:
+                        opnum = i.value_opnums[i.format.typevar_operand]
                         fmt.doc_comment(
                                 'Type inferred from {}.'
-                                .format(i.ins[i.format.typevar_operand]))
+                                .format(i.ins[opnum]))
                 # Enum variant itself.
                 if is_first_opcode:
                     fmt.line(i.camel_name + ' = 1,')
@@ -413,9 +411,9 @@ def gen_type_constraints(fmt, instrs):
             for idx in i.value_results:
                 constraints.append(
                         get_constraint(i.outs[idx], ctrl_typevar, type_sets))
-            for idx in i.format.value_operands:
+            for opnum in i.value_opnums:
                 constraints.append(
-                        get_constraint(i.ins[idx], ctrl_typevar, type_sets))
+                        get_constraint(i.ins[opnum], ctrl_typevar, type_sets))
             offset = operand_seqs.add(constraints)
             fixed_results = len(i.value_results)
             # Can the controlling type variable be inferred from the designated
@@ -477,11 +475,7 @@ def gen_format_constructor(iform, fmt):
     """
 
     # Construct method arguments.
-    if iform.has_value_list:
-        args = ['mut self']
-    else:
-        args = ['self']
-    args.append('opcode: Opcode')
+    args = ['self', 'opcode: Opcode']
 
     if iform.multiple_results:
         args.append('ctrl_typevar: Type')
@@ -491,9 +485,18 @@ def gen_format_constructor(iform, fmt):
         args.append('result_type: Type')
         result_type = 'result_type'
 
-    # Normal operand arguments.
-    for idx, kind in enumerate(iform.kinds):
-        args.append('op{}: {}'.format(idx, kind.rust_type))
+    # Normal operand arguments. Start with the immediate operands.
+    for kind, name in zip(iform.imm_kinds, iform.imm_members):
+        args.append('{}: {}'.format(name, kind.rust_type))
+    # Then the value operands.
+    if iform.has_value_list:
+        # Take all value arguments as a finished value list. The value lists
+        # are created by the individual instruction constructors.
+        args.append('args: ValueList')
+    else:
+        # Take a fixed number of value operands.
+        for i in range(iform.num_value_operands):
+            args.append('arg{}: Value'.format(i))
 
     proto = '{}({})'.format(iform.name, ', '.join(args))
     proto += " -> (Inst, &'f mut DataFlowGraph)"
@@ -501,21 +504,6 @@ def gen_format_constructor(iform, fmt):
     fmt.doc_comment(str(iform))
     fmt.line('#[allow(non_snake_case)]')
     with fmt.indented('fn {} {{'.format(proto), '}'):
-        # Start by constructing a value list with *all* the arguments.
-        if iform.has_value_list:
-            fmt.line('let mut vlist = ValueList::default();')
-            with fmt.indented('{', '}'):
-                fmt.line(
-                        'let pool = '
-                        '&mut self.data_flow_graph_mut().value_lists;')
-                for idx, kind in enumerate(iform.kinds):
-                    if kind is cdsl.operands.VALUE:
-                        fmt.line('vlist.push(op{}, pool);'.format(idx))
-                    elif kind is cdsl.operands.VARIABLE_ARGS:
-                        fmt.line(
-                                'vlist.extend(op{}.iter().cloned(), pool);'
-                                .format(idx))
-
         # Generate the instruction data.
         with fmt.indented(
                 'let data = InstructionData::{} {{'.format(iform.name), '};'):
@@ -543,20 +531,19 @@ def gen_member_inits(iform, fmt):
     Emit member initializers for an `iform` instruction.
     """
 
-    # Values first.
-    if iform.has_value_list:
-        # Value-list formats put *all* arguments in the list.
-        fmt.line('args: vlist,')
-    elif iform.num_value_operands == 1:
-        fmt.line('arg: op{},'.format(iform.value_operands[0]))
-    elif iform.num_value_operands > 1:
-        fmt.line('args: [{}],'.format(
-            ', '.join('op{}'.format(i) for i in iform.value_operands)))
+    # Immediate operands.
+    # We have local variables with the same names as the members.
+    for member in iform.imm_members:
+        fmt.line('{}: {},'.format(member, member))
 
-    # Immediates and entity references.
-    for idx, member in enumerate(iform.members):
-        if member:
-            fmt.line('{}: op{},'.format(member, idx))
+    # Value operands.
+    if iform.has_value_list:
+        fmt.line('args: args,')
+    elif iform.num_value_operands == 1:
+        fmt.line('arg: arg0,')
+    elif iform.num_value_operands > 1:
+        args = ('arg{}'.format(i) for i in range(iform.num_value_operands))
+        fmt.line('args: [{}],'.format(', '.join(args)))
 
 
 def gen_inst_builder(inst, fmt):
@@ -570,7 +557,10 @@ def gen_inst_builder(inst, fmt):
     """
 
     # Construct method arguments.
-    args = ['self']
+    if inst.format.has_value_list:
+        args = ['mut self']
+    else:
+        args = ['self']
 
     # The controlling type variable will be inferred from the input values if
     # possible. Otherwise, it is the first method argument.
@@ -621,9 +611,10 @@ def gen_inst_builder(inst, fmt):
             args.append('types::VOID')
         elif inst.is_polymorphic:
             # Infer the controlling type variable from the input operands.
+            opnum = inst.value_opnums[inst.format.typevar_operand]
             fmt.line(
                     'let ctrl_typevar = self.data_flow_graph().value_type({});'
-                    .format(inst.ins[inst.format.typevar_operand].name))
+                    .format(inst.ins[opnum].name))
             if inst.format.multiple_results:
                 # The format constructor will resolve the result types from the
                 # type var.
@@ -645,7 +636,32 @@ def gen_inst_builder(inst, fmt):
                     inst.outs[inst.value_results[0]]
                     .typevar.singleton_type.rust_name())
 
-        args.extend(op.name for op in inst.ins)
+        # Now add all of the immediate operands to the constructor arguments.
+        for opnum in inst.imm_opnums:
+            args.append(inst.ins[opnum].name)
+
+        # Finally, the value operands.
+        if inst.format.has_value_list:
+            # We need to build a value list with all the arguments.
+            fmt.line('let mut vlist = ValueList::default();')
+            args.append('vlist')
+            with fmt.indented('{', '}'):
+                fmt.line(
+                        'let pool = '
+                        '&mut self.data_flow_graph_mut().value_lists;')
+                for op in inst.ins:
+                    if op.is_value():
+                        fmt.line('vlist.push({}, pool);'.format(op.name))
+                    elif op.is_varargs():
+                        fmt.line(
+                            'vlist.extend({}.iter().cloned(), pool);'
+                            .format(op.name))
+        else:
+            # With no value list, we're guaranteed to just have a set of fixed
+            # value operands.
+            for opnum in inst.value_opnums:
+                args.append(inst.ins[opnum].name)
+
         # Call to the format constructor,
         fcall = 'self.{}({})'.format(inst.format.name, ', '.join(args))
 
